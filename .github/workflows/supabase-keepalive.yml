@@ -3,33 +3,87 @@ name: Supabase Keep Alive
 on:
   schedule:
     - cron: '0 4 */2 * *'
-  workflow_dispatch: {}  # 允许手动触发测试
+  workflow_dispatch:
 
 jobs:
   keep-alive:
     runs-on: ubuntu-latest
+
     steps:
       - name: Ping Supabase to prevent auto-pause
-        run: |
-          response=$(curl -s -w "\n%{http_code}" -X POST \
-            "${SUPABASE_URL}/rest/v1/keep_alive" \
-            -H "apikey: ${SUPABASE_KEY}" \
-            -H "Authorization: Bearer ${SUPABASE_KEY}" \
-            -H "Content-Type: application/json" \
-            -d '{"pinged_at": "now()"}')
-
-          http_code=$(echo "$response" | tail -n1)
-          body=$(echo "$response" | sed '$d')
-
-          echo "HTTP status: $http_code"
-          echo "Response: $body"
-
-          if [ "$http_code" -ge 400 ]; then
-            echo "❌ Keep-alive request failed"
-            exit 1
-          else
-            echo "✅ Keep-alive request succeeded"
-          fi
+        shell: bash
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+
+        run: |
+          set -uo pipefail
+
+          # 检查 Secret 是否存在
+          : "${SUPABASE_URL:?❌ Missing GitHub secret: SUPABASE_URL}"
+          : "${SUPABASE_KEY:?❌ Missing GitHub secret: SUPABASE_KEY}"
+
+          # 检查 URL 基本格式
+          case "$SUPABASE_URL" in
+            https://*)
+              ;;
+            *)
+              echo "❌ SUPABASE_URL 格式错误"
+              echo "正确格式应类似：https://xxxx.supabase.co"
+              exit 1
+              ;;
+          esac
+
+          API_URL="${SUPABASE_URL%/}/rest/v1/keep_alive"
+          RESPONSE_FILE="$(mktemp)"
+
+          # 公共请求头
+          CURL_HEADERS=(
+            -H "apikey: ${SUPABASE_KEY}"
+            -H "Content-Type: application/json"
+            -H "Prefer: return=representation"
+          )
+
+          # 旧版 anon/service_role 是 JWT，需要 Authorization Bearer
+          # 新版 sb_secret_/sb_publishable_ 不能作为 Bearer JWT
+          if [[ "$SUPABASE_KEY" != sb_secret_* &&
+                "$SUPABASE_KEY" != sb_publishable_* ]]; then
+            CURL_HEADERS+=(
+              -H "Authorization: Bearer ${SUPABASE_KEY}"
+            )
+          fi
+
+          set +e
+
+          HTTP_CODE=$(curl \
+            --silent \
+            --show-error \
+            --output "$RESPONSE_FILE" \
+            --write-out "%{http_code}" \
+            --request POST \
+            "$API_URL" \
+            "${CURL_HEADERS[@]}" \
+            --data '{}')
+
+          CURL_CODE=$?
+
+          set -e
+
+          RESPONSE_BODY="$(cat "$RESPONSE_FILE")"
+          rm -f "$RESPONSE_FILE"
+
+          echo "curl exit code: $CURL_CODE"
+          echo "HTTP status: $HTTP_CODE"
+          echo "Response: $RESPONSE_BODY"
+
+          if [ "$CURL_CODE" -ne 0 ]; then
+            echo "❌ Network request failed"
+            exit "$CURL_CODE"
+          fi
+
+          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+            echo "❌ Supabase returned an HTTP error"
+            exit 1
+          fi
+
+          echo "✅ Keep-alive request succeeded"
